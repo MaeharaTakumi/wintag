@@ -1,0 +1,350 @@
+#!/bin/bash
+# wintag：GUI アプリのウィンドウを起動元（ホスト・Docker コンテナ）ごとに見分けられるよう、名前とアイコンを付ける
+# 使い方：
+#   wintag watch                   … ウィンドウを監視し、コンテナのアプリを自動で識別・登録（ログイン時に自動起動）
+#   wintag register [コマンド...]  … クリックしたウィンドウを手動で登録（ホストのアプリ、起動コマンドの変更など）
+#   wintag list                    … 登録済みエントリの一覧
+#   wintag remove <エントリID>     … エントリを削除
+#   wintag cleanup                 … 削除済みコンテナのエントリをまとめて削除
+#   wintag launch <エントリID>     … 登録済みアプリを起動（.desktop から呼ばれる）
+
+# ===== パラメータ =====
+APP_DIR="${HOME}/.local/share/applications"      # .desktop の置き場（GNOME が読む場所）
+DATA_DIR="${HOME}/.local/share/wintag"           # エントリごとのデータ置き場
+PREFIX="wintag-"                                 # 生成する .desktop のファイル名接頭辞
+HOST="host"                                      # ホストで動くアプリを表す起動元名・ID 接頭辞
+HOST_NAME="$(hostname)"                          # ホストのホスト名（コンテナとの区別に使用）
+XHOST_RULE="+local:"                             # コンテナからの X 接続許可ルール
+FALLBACK_ICON="application-x-executable"         # ウィンドウにアイコンがない場合のアイコン名
+ICON_MAX_BYTES=67108864                          # アイコン読み取りの上限（xprop の既定 250000 バイトでは大きいアイコンが欠ける）
+HOST_SKIP_VARS=(DISPLAY XAUTHORITY WAYLAND_DISPLAY XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
+  SESSION_MANAGER SSH_AUTH_SOCK XDG_SESSION_ID DESKTOP_STARTUP_ID XDG_ACTIVATION_TOKEN)  # ホストのアプリで保存しない変数（起動時のセッションの値を使う）
+CONTAINER_SKIP_VARS=(DISPLAY)                    # コンテナのアプリで保存しない変数（起動時に現在の値を渡す）
+ID_PATTERN='^[A-Za-z0-9_-]+$'                    # エントリ ID として認める文字
+HELP_LINES="2,9p"                                # ヘルプとして表示する行範囲
+LOCK_FILE="${XDG_RUNTIME_DIR:-/tmp}/wintag-watch-${UID}.lock"  # watch の多重起動防止用ロック
+SELF="$(readlink -f "$0")"                       # このスクリプト自身の絶対パス
+LIB_DIR="/usr/lib/wintag"                        # 補助スクリプトのインストール先
+ICON_SCRIPT="${LIB_DIR}/wintag-icon.py"          # アイコン抽出用スクリプト
+SOURCE_SCRIPT="${LIB_DIR}/wintag-source.py"      # 起動元判定用スクリプト
+
+# エントリが 0 件のときに glob が文字列のまま残らないようにする
+shopt -s nullglob
+
+# 機能：エラーを表示する（Dock から起動した場合にも見えるよう、可能なら通知も出す）
+# 入力：$1 メッセージ
+# 出力：終了コード 1
+fail() {
+  echo "$1" >&2
+  command -v notify-send > /dev/null && notify-send "wintag" "$1"
+  return 1
+}
+
+# 機能：エントリ ID が正しい形式か確認する（パスとして使うため、/ や .. を含むものを弾く）
+# 入力：$1 エントリ ID
+# 出力：終了コード（0：正しい）
+valid_id() {
+  [[ "$1" =~ ${ID_PATTERN} ]]
+}
+
+# 機能：クリックされたウィンドウの ID を取得する
+# 入力：なし（マウスクリック）
+# 出力：ウィンドウ ID（例 0x3a00004）を標準出力へ
+pick_window() {
+  echo "登録するアプリのウィンドウをクリックしてください" >&2
+  xwininfo | awk '/Window id:/{print $4}'
+}
+
+# 機能：ウィンドウの文字列プロパティから n 番目の値を取り出す
+# 入力：$1 ウィンドウ ID, $2 プロパティ名, $3 何番目の値か（1 始まり）
+# 出力：値（なければ空）を標準出力へ
+win_string() {
+  xprop -id "$1" "$2" | awk -F'"' -v n="$3" '{print $(2 * n)}'
+}
+
+# 機能：ウィンドウを作ったプロセスの PID を取得する
+# 入力：$1 ウィンドウ ID
+# 出力：PID（アプリが設定していなければ空）を標準出力へ
+win_pid() {
+  xprop -id "$1" -notype _NET_WM_PID | awk -F' = ' 'NF > 1 {print $2}'
+}
+
+# 機能：起動元（ホストまたはコンテナ）でコマンドを実行する
+# 入力：$1 起動元（host またはコンテナ ID）, $2... 実行するコマンド
+# 出力：コマンドの出力
+in_source() {
+  local src="$1"
+  shift
+  if [ "${src}" = "${HOST}" ]; then
+    "$@"
+  else
+    docker exec -u 0 "${src}" "$@"
+  fi
+}
+
+# 機能：ウィンドウの起動元と、起動元から見たプロセスの PID を判定する
+#       X サーバーから見たクライアントのプロセスで判定し、取得できない場合（TCP 経由の接続など）は
+#       WM_CLIENT_MACHINE がホストと異なり、ホスト名が一致するコンテナが 1 つだけのときに限り判定する
+# 入力：$1 ウィンドウ ID
+# 出力：「起動元 PID」（起動元はコンテナのフル ID または host）。判定できなければ何も出力しない
+window_source() {
+  local win="$1" src machine
+  local cands=()
+
+  src="$(python3 "${SOURCE_SCRIPT}" "${win}")"
+  [ -n "${src}" ] && { echo "${src}"; return; }
+
+  machine="$(win_string "${win}" WM_CLIENT_MACHINE 1)"
+  [ "${machine}" != "${HOST_NAME}" ] || return
+  mapfile -t cands < <(docker ps -q 2>/dev/null \
+    | xargs -r docker inspect -f '{{.Id}} {{.Config.Hostname}}' \
+    | awk -v m="${machine}" '$2 == m {print $1}')
+  [ "${#cands[@]}" -eq 1 ] && echo "${cands[0]} $(win_pid "${win}")"
+}
+
+# 機能：エントリ ID を作る（ホスト：host-クラス名／コンテナ：コンテナID先頭12桁-クラス名）
+# 入力：$1 起動元, $2 WM_CLASS のクラス名
+# 出力：エントリ ID を標準出力へ
+entry_id() {
+  local prefix="${HOST}"
+  [ "$1" = "${HOST}" ] || prefix="${1:0:12}"
+  echo "${prefix}-${2//[^A-Za-z0-9]/_}"
+}
+
+# 機能：ウィンドウのインスタンス名をエントリ ID に付け替え、対応する .desktop に結びつける
+# 入力：$1 ウィンドウ ID, $2 エントリ ID
+# 出力：なし
+set_tag() {
+  xdotool set_window --classname "$2" "$1"
+}
+
+# 機能：プロセスの環境変数を NUL 区切りのまま取り出す
+#       「名前=値」の形でないもの（Electron などが上書きした領域）と、指定した変数は除く
+# 入力：$1 起動元, $2 PID, $3... 除く変数名
+# 出力：環境変数（NUL 区切り）を標準出力へ
+proc_environ() {
+  local src="$1" pid="$2" skip
+  shift 2
+  skip="$(IFS='|'; echo "$*")"
+  in_source "${src}" cat "/proc/${pid}/environ" \
+    | grep -zE '^[A-Za-z_][A-Za-z0-9_%]*=' \
+    | grep -zvE "^(${skip})="
+}
+
+# 機能：ウィンドウのアプリをエントリとして保存し、.desktop を作成する
+#       一時フォルダに集めてから置き換えるため、途中で失敗しても既存のエントリは残る
+# 入力：$1 ウィンドウ ID, $2 起動元, $3 PID, $4 WM_CLASS のクラス名, $5... 起動コマンド（省略時は元プロセスのコマンド）
+# 出力：エントリ ID を標準出力へ（失敗時は終了コード 1）
+capture() {
+  local win="$1" src="$2" pid="$3" wm_class="$4" id dir tmp name match icon
+  shift 4
+  id="$(entry_id "${src}" "${wm_class}")"
+  dir="${DATA_DIR}/${id}"
+  tmp="${DATA_DIR}/.${id}.$$"
+  rm -rf "${tmp}"
+  mkdir -p "${tmp}" "${APP_DIR}"
+
+  # 起動コマンド（NUL 区切り）：引数があればそれを、なければ元プロセスのコマンドを保存
+  if [ "$#" -gt 0 ]; then
+    printf '%s\0' "$@" > "${tmp}/cmdline"
+  else
+    in_source "${src}" cat "/proc/${pid}/cmdline" > "${tmp}/cmdline"
+  fi
+  if [ ! -s "${tmp}/cmdline" ]; then
+    rm -rf "${tmp}"
+    echo "起動コマンドを取得できませんでした（プロセスが終了した可能性があります）" >&2
+    return 1
+  fi
+
+  # 表示名と対応付けの値（ホスト：クラス名のまま／コンテナ：付け替え後のインスタンス名＝エントリ ID）
+  # 環境変数（NUL 区切り）と作業ディレクトリも保存する
+  if [ "${src}" = "${HOST}" ]; then
+    proc_environ "${src}" "${pid}" "${HOST_SKIP_VARS[@]}" > "${tmp}/environ"
+    name="${wm_class}"
+    match="${wm_class}"
+  else
+    proc_environ "${src}" "${pid}" "${CONTAINER_SKIP_VARS[@]}" > "${tmp}/environ"
+    docker inspect -f '{{.Id}}' "${src}" > "${tmp}/container"
+    in_source "${src}" stat -c '%u:%g' "/proc/${pid}" > "${tmp}/user"
+    name="${wm_class} ($(docker inspect -f '{{.Name}}' "${src}" | sed 's,^/,,'))"
+    match="${id}"
+  fi
+  in_source "${src}" readlink "/proc/${pid}/cwd" > "${tmp}/cwd"
+
+  # ウィンドウ自身のアイコンを PNG で保存（なければ汎用アイコン）
+  xprop -len "${ICON_MAX_BYTES}" -id "${win}" -notype 32c _NET_WM_ICON | python3 "${ICON_SCRIPT}" "${tmp}/icon.png"
+  icon="${dir}/icon.png"
+  [ -s "${tmp}/icon.png" ] || icon="${FALLBACK_ICON}"
+
+  # 集めたデータで既存のエントリを置き換える
+  rm -rf "${dir}"
+  mv "${tmp}" "${dir}"
+
+  # .desktop を作成
+  cat > "${APP_DIR}/${PREFIX}${id}.desktop" <<EOF
+[Desktop Entry]
+Name=${name}
+Exec=${SELF} launch ${id}
+Icon=${icon}
+StartupWMClass=${match}
+Type=Application
+Terminal=false
+Categories=Development;
+EOF
+  echo "${id}"
+}
+
+# 機能：新しいウィンドウがコンテナのアプリなら、エントリを用意してインスタンス名を付け替える
+# 入力：$1 ウィンドウ ID
+# 出力：なし
+auto_tag() {
+  local win="$1" wm_class src pid id
+  wm_class="$(win_string "${win}" WM_CLASS 2)"
+  [ -n "${wm_class}" ] || return
+
+  # ホストのアプリ・判定できないウィンドウは対象外
+  read -r src pid < <(window_source "${win}")
+  [ -n "${src}" ] && [ "${src}" != "${HOST}" ] || return
+
+  # 未登録なら自動登録（登録済みなら、手動で変えた起動コマンドなどを保持）
+  id="$(entry_id "${src}" "${wm_class}")"
+  [ -d "${DATA_DIR}/${id}" ] || capture "${win}" "${src}" "${pid}" "${wm_class}" > /dev/null || return
+  set_tag "${win}" "${id}"
+}
+
+# 機能：ウィンドウ一覧を監視し、新しく開いたウィンドウごとに auto_tag を実行する（常駐）
+# 入力：なし
+# 出力：なし
+watch_windows() {
+  local line w
+  local -A prev=() cur=()
+
+  # 同じユーザーで 2 つ動くとエントリの作成が競合するため、1 つに限る
+  exec 9> "${LOCK_FILE}"
+  flock -n 9 || { echo "wintag watch は既に動いています" >&2; exit 1; }
+
+  # 起動時に、削除済みコンテナのエントリを片付ける
+  cleanup
+
+  # ウィンドウ一覧（_NET_CLIENT_LIST）が変わるたびに 1 行届く（ロックは引き継がない）
+  while read -r line; do
+    cur=()
+    for w in $(grep -o '0x[0-9a-fA-F]*' <<< "${line}"); do
+      cur[$w]=1
+      [ -n "${prev[$w]}" ] || auto_tag "$w" 9>&-
+    done
+    # 今回の一覧を次回の比較用に保存（閉じたウィンドウは消える）
+    prev=()
+    for w in "${!cur[@]}"; do
+      prev[$w]=1
+    done
+  done < <(xprop -root -spy _NET_CLIENT_LIST 9>&-)
+}
+
+# 機能：クリックしたウィンドウのアプリを手動で登録する
+# 入力：$@ 起動コマンド（省略時はウィンドウのプロセスと同じコマンド）
+# 出力：エントリの作成と結果の表示
+register() {
+  local win wm_class src pid id
+
+  win="$(pick_window)"
+  wm_class="$(win_string "${win}" WM_CLASS 2)"
+  [ -n "${wm_class}" ] || { echo "WM_CLASS を取得できませんでした" >&2; exit 1; }
+
+  # 起動元を特定。見つからない場合は、指定コマンドをこのシェルの環境でホスト起動する
+  read -r src pid < <(window_source "${win}")
+  if [ -z "${src}" ]; then
+    [ "$#" -gt 0 ] || { echo "起動元を特定できません。起動コマンドを指定してください（例：wintag register matlab -desktop）" >&2; exit 1; }
+    src="${HOST}"
+    pid="$$"
+  fi
+
+  # 登録し、コンテナのアプリはすぐに付け替えて区別されるようにする
+  id="$(capture "${win}" "${src}" "${pid}" "${wm_class}" "$@")" || exit 1
+  [ "${src}" = "${HOST}" ] || set_tag "${win}" "${id}"
+  echo "登録しました: $(sed -n 's/^Name=//p' "${APP_DIR}/${PREFIX}${id}.desktop")（ID: ${id}）"
+}
+
+# 機能：登録済みアプリを、保存した環境・作業ディレクトリで起動する（ホストまたはコンテナ内）
+# 入力：$1 エントリ ID
+# 出力：アプリのウィンドウ
+launch() {
+  local dir="${DATA_DIR}/$1" cid cwd v
+  local cmd=() envs=() opts=()
+
+  # 登録がない（削除済みなど）場合は何も起動しない
+  valid_id "$1" && [ -s "${dir}/cmdline" ] || { fail "エントリ '$1' は登録されていません"; return; }
+  mapfile -d '' cmd < "${dir}/cmdline"
+  cwd="$(cat "${dir}/cwd")"
+
+  # 環境変数（NUL 区切り）。旧形式（改行区切りの env）のエントリも読めるようにする
+  if [ -f "${dir}/environ" ]; then
+    mapfile -d '' envs < "${dir}/environ"
+  else
+    mapfile -t envs < "${dir}/env"
+  fi
+
+  if [ -f "${dir}/container" ]; then
+    # コンテナ：X 接続を許可し、停止中ならコンテナを起動してから実行（名前の付け替えは watch が行う）
+    cid="$(cat "${dir}/container")"
+    xhost "${XHOST_RULE}" > /dev/null
+    docker start "${cid}" > /dev/null || { fail "コンテナ ${cid:0:12} を起動できません（削除された可能性があります）"; return; }
+    for v in "${envs[@]}"; do
+      opts+=(-e "${v}")
+    done
+    [ -n "${cwd}" ] && opts+=(-w "${cwd}")
+    docker exec "${opts[@]}" -e DISPLAY="${DISPLAY}" -u "$(cat "${dir}/user")" "${cid}" "${cmd[@]}"
+  else
+    # ホスト：現在のセッションの環境に、保存した環境変数を重ねて実行
+    cd "${cwd}" || { fail "作業ディレクトリ ${cwd} に移動できません"; return; }
+    exec env "${envs[@]}" "${cmd[@]}"
+  fi
+}
+
+# 機能：登録済みエントリの一覧を表示する
+# 入力：なし
+# 出力：「エントリ ID<TAB>表示名」を 1 行ずつ標準出力へ
+list() {
+  local dir id
+  for dir in "${DATA_DIR}"/*/; do
+    id="$(basename "${dir}")"
+    printf '%s\t%s\n' "${id}" "$(sed -n 's/^Name=//p' "${APP_DIR}/${PREFIX}${id}.desktop" 2>/dev/null)"
+  done
+}
+
+# 機能：指定したエントリ（.desktop とデータ）を削除する
+# 入力：$1 エントリ ID
+# 出力：該当ファイルの削除
+remove() {
+  # ID が空や ../ を含むと別のフォルダを消してしまうため確認する
+  valid_id "$1" || { echo "エントリ ID を指定してください（wintag list で確認）" >&2; return 1; }
+  rm -rf "${DATA_DIR:?}/$1" "${APP_DIR}/${PREFIX}$1.desktop"
+}
+
+# 機能：既に存在しないコンテナのエントリを削除する（ホストのエントリは対象外）
+# 入力：なし
+# 出力：該当ファイルの削除
+cleanup() {
+  local dir ids
+
+  # 全コンテナ（停止中含む）の ID 一覧。Docker に接続できないときは何も消さずに終了
+  ids="$(docker ps -aq --no-trunc 2>/dev/null)" || return 1
+
+  # 一覧にないコンテナのエントリを削除
+  for dir in "${DATA_DIR}"/*/; do
+    [ -f "${dir}container" ] || continue
+    grep -qxF "$(cat "${dir}container")" <<< "${ids}" \
+      || remove "$(basename "${dir}")"
+  done
+}
+
+# サブコマンドの振り分け
+case "$1" in
+  watch)    watch_windows ;;
+  register) shift; register "$@" ;;
+  list)     list ;;
+  remove)   remove "$2" ;;
+  cleanup)  cleanup ;;
+  launch)   launch "$2" ;;
+  *)        sed -n "${HELP_LINES}" "${SELF}" ;;
+esac

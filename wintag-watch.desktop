@@ -1,9 +1,0 @@
-[Desktop Entry]
-# ログイン時に wintag の監視を開始する（削除済みコンテナの片付けも 1 回行う）
-Type=Application
-Name=wintag
-Comment=Tag windows of GUI apps by their source (host or Docker container)
-Exec=/usr/bin/wintag watch
-# アプリ一覧には表示しない
-NoDisplay=true
-X-GNOME-Autostart-enabled=true

@@ -1,7 +1,10 @@
 #!/bin/bash
-# wintag：GUI アプリのウィンドウを起動元（ホスト・Docker コンテナ）ごとに見分けられるよう、名前とアイコンを付ける
+# wintag：Docker コンテナで動く GUI アプリのウィンドウタイトルに起動元のコンテナ名を付け、Dock から起動元を選んで起動できるようにする
 # 使い方：
-#   wintag watch                   … ウィンドウを監視し、コンテナのアプリを自動で識別・登録（ログイン時に自動起動）
+#   wintag on                      … ウィンドウ監視をオン（すぐに開始し、ログイン時にも自動で開始）
+#   wintag off                     … ウィンドウ監視をオフ（既定）
+#   wintag status                  … 監視のオン・オフと実行状態を表示
+#   wintag watch                   … ウィンドウを監視し、コンテナのアプリにタイトルを付けて自動で登録（on で起動される）
 #   wintag register [コマンド...]  … クリックしたウィンドウを手動で登録（ホストのアプリ、起動コマンドの変更など）
 #   wintag list                    … 登録済みエントリの一覧
 #   wintag remove <エントリID>     … エントリを削除
@@ -11,9 +14,13 @@
 # ===== パラメータ =====
 APP_DIR="${HOME}/.local/share/applications"      # .desktop の置き場（GNOME が読む場所）
 DATA_DIR="${HOME}/.local/share/wintag"           # エントリごとのデータ置き場
+AUTOSTART_FILE="${HOME}/.config/autostart/wintag-watch.desktop"  # 監視オン時に作るログイン時の自動起動設定
 PREFIX="wintag-"                                 # 生成する .desktop のファイル名接頭辞
 HOST="host"                                      # ホストで動くアプリを表す起動元名・ID 接頭辞
+HOST_LABEL="ホスト"                              # ホストの起動元の表示名
 HOST_NAME="$(hostname)"                          # ホストのホスト名（コンテナとの区別に使用）
+TITLE_FORMAT="[%s] "                             # ウィンドウタイトルの先頭に付ける起動元名の書式
+ACTION_FORMAT="%s で起動"                        # Dock の右クリックメニューに出す起動項目の書式
 XHOST_RULE="+local:"                             # コンテナからの X 接続許可ルール
 FALLBACK_ICON="application-x-executable"         # ウィンドウにアイコンがない場合のアイコン名
 ICON_MAX_BYTES=67108864                          # アイコン読み取りの上限（xprop の既定 250000 バイトでは大きいアイコンが欠ける）
@@ -21,8 +28,8 @@ HOST_SKIP_VARS=(DISPLAY XAUTHORITY WAYLAND_DISPLAY XDG_RUNTIME_DIR DBUS_SESSION_
   SESSION_MANAGER SSH_AUTH_SOCK XDG_SESSION_ID DESKTOP_STARTUP_ID XDG_ACTIVATION_TOKEN)  # ホストのアプリで保存しない変数（起動時のセッションの値を使う）
 CONTAINER_SKIP_VARS=(DISPLAY)                    # コンテナのアプリで保存しない変数（起動時に現在の値を渡す）
 ID_PATTERN='^[A-Za-z0-9_-]+$'                    # エントリ ID として認める文字
-HELP_LINES="2,9p"                                # ヘルプとして表示する行範囲
-LOCK_FILE="${XDG_RUNTIME_DIR:-/tmp}/wintag-watch-${UID}.lock"  # watch の多重起動防止用ロック
+HELP_LINES="2,12p"                               # ヘルプとして表示する行範囲
+LOCK_FILE="${XDG_RUNTIME_DIR:-/tmp}/wintag-watch-${UID}.lock"  # watch の多重起動防止用ロック（中身は watch の PID）
 SELF="$(readlink -f "$0")"                       # このスクリプト自身の絶対パス
 LIB_DIR="/usr/lib/wintag"                        # 補助スクリプトのインストール先
 ICON_SCRIPT="${LIB_DIR}/wintag-icon.py"          # アイコン抽出用スクリプト
@@ -111,11 +118,11 @@ entry_id() {
   echo "${prefix}-${2//[^A-Za-z0-9]/_}"
 }
 
-# 機能：ウィンドウのインスタンス名をエントリ ID に付け替え、対応する .desktop に結びつける
-# 入力：$1 ウィンドウ ID, $2 エントリ ID
-# 出力：なし
-set_tag() {
-  xdotool set_window --classname "$2" "$1"
+# 機能：アプリ（WM_CLASS のクラス名）に対応する .desktop のパスを返す
+# 入力：$1 クラス名
+# 出力：パスを標準出力へ
+desktop_file() {
+  echo "${APP_DIR}/${PREFIX}${1//[^A-Za-z0-9]/_}.desktop"
 }
 
 # 機能：プロセスの環境変数を NUL 区切りのまま取り出す
@@ -131,18 +138,111 @@ proc_environ() {
     | grep -zvE "^(${skip})="
 }
 
-# 機能：ウィンドウのアプリをエントリとして保存し、.desktop を作成する
+# 機能：アプリ（クラス名）の .desktop を、同じクラスの全エントリから作り直す
+#       Dock のアイコンはアプリごとに 1 つ。クリックで最後に使った起動元から起動し、
+#       右クリックメニューに起動元ごとの起動項目を並べる。エントリがなければ .desktop を消す
+# 入力：$1 クラス名
+# 出力：.desktop の作成・更新・削除
+write_desktop() {
+  local class="$1" file dir id name newest="" n=0 actions="" body="" tmp
+  local dirs=() rows=()
+  file="$(desktop_file "${class}")"
+
+  # 同じクラスのエントリを「表示名<TAB>ID」で集め、表示名順に並べる。最後に使ったもの（更新が最新）を既定にする
+  dirs=("${DATA_DIR}"/*/)
+  [ "${#dirs[@]}" -gt 0 ] && while read -r dir; do
+    [ "$(cat "${dir}class" 2>/dev/null)" = "${class}" ] || continue
+    id="$(basename "${dir}")"
+    [ -n "${newest}" ] || newest="${id}"
+    rows+=("$(cat "${dir}name")	${id}")
+  done < <(ls -td "${dirs[@]}")
+  [ -n "${newest}" ] || { rm -f "${file}"; return; }
+
+  while IFS=$'\t' read -r name id; do
+    n=$((n + 1))
+    actions+="src${n};"
+    # shellcheck disable=SC2059
+    body+="
+[Desktop Action src${n}]
+Name=$(printf "${ACTION_FORMAT}" "${name}")
+Exec=${SELF} launch ${id}
+"
+  done < <(printf '%s\n' "${rows[@]}" | sort)
+
+  # 内容が変わったときだけ書き換える（GNOME の再読み込みを減らす）
+  mkdir -p "${APP_DIR}"
+  tmp="$(mktemp "${APP_DIR}/.${PREFIX}XXXXXX")"
+  dir="${DATA_DIR}/${newest}"
+  cat > "${tmp}" <<EOF
+[Desktop Entry]
+Name=${class}
+Exec=${SELF} launch ${newest}
+Icon=$([ -s "${dir}/icon.png" ] && echo "${dir}/icon.png" || echo "${FALLBACK_ICON}")
+StartupWMClass=${class}
+Type=Application
+Terminal=false
+Categories=Development;
+Actions=${actions}
+${body}
+EOF
+  if cmp -s "${tmp}" "${file}"; then
+    rm -f "${tmp}"
+  else
+    chmod 644 "${tmp}"
+    mv "${tmp}" "${file}"
+  fi
+}
+
+# 機能：2.1.0 以前の形式のエントリ（class・name ファイルがない）を、旧 .desktop から補って移行する
+# 入力：$1 エントリのフォルダ
+# 出力：終了コード（0：移行済み・不要、1：移行できない）
+migrate_entry() {
+  local dir="$1" old name
+  [ -f "${dir}/class" ] && return
+  old="${APP_DIR}/${PREFIX}$(basename "${dir}").desktop"
+  [ -f "${old}" ] || return 1
+  name="$(sed -n 's/^Name=//p' "${old}")"
+  if [ -f "${dir}/container" ]; then
+    # 旧形式の表示名は「クラス名 (コンテナ名)」
+    sed 's/ ([^()]*)$//' <<< "${name}" > "${dir}/class"
+    sed -n 's/.* (\([^()]*\))$/\1/p' <<< "${name}" > "${dir}/name"
+  else
+    sed -n 's/^StartupWMClass=//p' "${old}" > "${dir}/class"
+    echo "${HOST_LABEL}" > "${dir}/name"
+  fi
+}
+
+# 機能：全エントリから .desktop を作り直し、対応するエントリのない wintag の .desktop を消す
+# 入力：なし
+# 出力：.desktop の作成・更新・削除
+refresh_desktops() {
+  local dir file c
+  local -A keep=() classes=()
+  for dir in "${DATA_DIR}"/*/; do
+    migrate_entry "${dir}" || { remove_entry "$(basename "${dir}")"; continue; }
+    classes["$(cat "${dir}class")"]=1
+  done
+  for c in "${!classes[@]}"; do
+    write_desktop "${c}"
+    keep["$(desktop_file "${c}")"]=1
+  done
+  for file in "${APP_DIR}/${PREFIX}"*.desktop; do
+    [ -n "${keep[${file}]}" ] || rm -f "${file}"
+  done
+}
+
+# 機能：ウィンドウのアプリをエントリとして保存し、.desktop を更新する
 #       一時フォルダに集めてから置き換えるため、途中で失敗しても既存のエントリは残る
 # 入力：$1 ウィンドウ ID, $2 起動元, $3 PID, $4 WM_CLASS のクラス名, $5... 起動コマンド（省略時は元プロセスのコマンド）
 # 出力：エントリ ID を標準出力へ（失敗時は終了コード 1）
 capture() {
-  local win="$1" src="$2" pid="$3" wm_class="$4" id dir tmp name match icon
+  local win="$1" src="$2" pid="$3" wm_class="$4" id dir tmp
   shift 4
   id="$(entry_id "${src}" "${wm_class}")"
   dir="${DATA_DIR}/${id}"
   tmp="${DATA_DIR}/.${id}.$$"
   rm -rf "${tmp}"
-  mkdir -p "${tmp}" "${APP_DIR}"
+  mkdir -p "${tmp}"
 
   # 起動コマンド（NUL 区切り）：引数があればそれを、なければ元プロセスのコマンドを保存
   if [ "$#" -gt 0 ]; then
@@ -156,47 +256,32 @@ capture() {
     return 1
   fi
 
-  # 表示名と対応付けの値（ホスト：クラス名のまま／コンテナ：付け替え後のインスタンス名＝エントリ ID）
-  # 環境変数（NUL 区切り）と作業ディレクトリも保存する
+  # アプリ名（クラス名）、起動元の表示名、環境変数（NUL 区切り）、作業ディレクトリ
+  echo "${wm_class}" > "${tmp}/class"
   if [ "${src}" = "${HOST}" ]; then
+    echo "${HOST_LABEL}" > "${tmp}/name"
     proc_environ "${src}" "${pid}" "${HOST_SKIP_VARS[@]}" > "${tmp}/environ"
-    name="${wm_class}"
-    match="${wm_class}"
   else
-    proc_environ "${src}" "${pid}" "${CONTAINER_SKIP_VARS[@]}" > "${tmp}/environ"
+    docker inspect -f '{{.Name}}' "${src}" | sed 's,^/,,' > "${tmp}/name"
     docker inspect -f '{{.Id}}' "${src}" > "${tmp}/container"
     in_source "${src}" stat -c '%u:%g' "/proc/${pid}" > "${tmp}/user"
-    name="${wm_class} ($(docker inspect -f '{{.Name}}' "${src}" | sed 's,^/,,'))"
-    match="${id}"
+    proc_environ "${src}" "${pid}" "${CONTAINER_SKIP_VARS[@]}" > "${tmp}/environ"
   fi
   in_source "${src}" readlink "/proc/${pid}/cwd" > "${tmp}/cwd"
 
-  # ウィンドウ自身のアイコンを PNG で保存（なければ汎用アイコン）
+  # ウィンドウ自身のアイコンを PNG で保存（なければ .desktop では汎用アイコンを使う）
   xprop -len "${ICON_MAX_BYTES}" -id "${win}" -notype 32c _NET_WM_ICON | python3 "${ICON_SCRIPT}" "${tmp}/icon.png"
-  icon="${dir}/icon.png"
-  [ -s "${tmp}/icon.png" ] || icon="${FALLBACK_ICON}"
 
-  # 集めたデータで既存のエントリを置き換える
+  # 集めたデータで既存のエントリを置き換え、アプリの .desktop に反映する
   rm -rf "${dir}"
   mv "${tmp}" "${dir}"
-
-  # .desktop を作成
-  cat > "${APP_DIR}/${PREFIX}${id}.desktop" <<EOF
-[Desktop Entry]
-Name=${name}
-Exec=${SELF} launch ${id}
-Icon=${icon}
-StartupWMClass=${match}
-Type=Application
-Terminal=false
-Categories=Development;
-EOF
+  write_desktop "${wm_class}"
   echo "${id}"
 }
 
-# 機能：新しいウィンドウがコンテナのアプリなら、エントリを用意してインスタンス名を付け替える
+# 機能：新しいウィンドウがコンテナのアプリなら、未登録のときは登録し、タイトルに付ける接頭辞を返す
 # 入力：$1 ウィンドウ ID
-# 出力：なし
+# 出力：タイトルの接頭辞（例「[whillLocalizer] 」）を標準出力へ。対象外なら何も出力しない
 auto_tag() {
   local win="$1" wm_class src pid id
   wm_class="$(win_string "${win}" WM_CLASS 2)"
@@ -209,36 +294,118 @@ auto_tag() {
   # 未登録なら自動登録（登録済みなら、手動で変えた起動コマンドなどを保持）
   id="$(entry_id "${src}" "${wm_class}")"
   [ -d "${DATA_DIR}/${id}" ] || capture "${win}" "${src}" "${pid}" "${wm_class}" > /dev/null || return
-  set_tag "${win}" "${id}"
+  # shellcheck disable=SC2059
+  printf "${TITLE_FORMAT}" "$(cat "${DATA_DIR}/${id}/name")"
 }
 
-# 機能：ウィンドウ一覧を監視し、新しく開いたウィンドウごとに auto_tag を実行する（常駐）
+# 機能：ウィンドウタイトルの先頭に接頭辞を付け、アプリがタイトルを変えるたびに付け直す
+# 入力：$1 ウィンドウ ID, $2 接頭辞, 標準入力 xprop -notype -spy _NET_WM_NAME の出力
+# 出力：ウィンドウタイトルの変更
+keep_title() {
+  local win="$1" prefix="$2" line title
+  while read -r line; do
+    # 「_NET_WM_NAME = "タイトル"」以外（not found など）は無視
+    [[ "${line}" == *' = "'*'"' ]] || continue
+    title="${line#*= \"}"
+    title="${title%\"}"
+    # xprop が付けたエスケープ（\\ と \"）を戻す
+    title="${title//\\\\/$'\x01'}"
+    title="${title//\\\"/\"}"
+    title="${title//$'\x01'/\\}"
+    [[ "${title}" == "${prefix}"* ]] && continue
+    xprop -id "${win}" -f _NET_WM_NAME 8u -set _NET_WM_NAME "${prefix}${title}"
+  done
+}
+
+# 機能：ウィンドウ一覧を監視し、新しく開いたコンテナのアプリのウィンドウにタイトルを付ける（常駐）
 # 入力：なし
 # 出力：なし
 watch_windows() {
-  local line w
+  local line w prefix
   local -A prev=() cur=()
+  declare -gA SPIES=()
 
-  # 同じユーザーで 2 つ動くとエントリの作成が競合するため、1 つに限る
+  # 同じユーザーで 2 つ動くとエントリの作成が競合するため、1 つに限る。off で止められるよう PID を書いておく
   exec 9> "${LOCK_FILE}"
   flock -n 9 || { echo "wintag watch は既に動いています" >&2; exit 1; }
+  echo "$$" >&9
+
+  # 終了時に、タイトル監視とウィンドウ一覧の監視を止める
+  trap 'kill "${SPIES[@]}" "${ROOT_SPY}" 2>/dev/null' EXIT
+  trap 'exit 0' TERM INT HUP
 
   # 起動時に、削除済みコンテナのエントリを片付ける
   cleanup
 
-  # ウィンドウ一覧（_NET_CLIENT_LIST）が変わるたびに 1 行届く（ロックは引き継がない）
-  while read -r line; do
+  # ウィンドウ一覧（_NET_CLIENT_LIST）が変わるたびに 1 行届く（子プロセスにはロックを引き継がない）
+  exec 3< <(xprop -root -spy _NET_CLIENT_LIST 9>&-)
+  ROOT_SPY=$!
+  while read -r line <&3; do
     cur=()
     for w in $(grep -o '0x[0-9a-fA-F]*' <<< "${line}"); do
       cur[$w]=1
-      [ -n "${prev[$w]}" ] || auto_tag "$w" 9>&-
+      [ -z "${prev[$w]}" ] || continue
+      prefix="$(auto_tag "$w" 9>&-)"
+      [ -n "${prefix}" ] || continue
+      # ウィンドウごとにタイトルを監視し、接頭辞を付け続ける（ウィンドウが閉じると xprop は終了する）
+      xprop -id "$w" -notype -spy _NET_WM_NAME 9>&- 2>/dev/null > >(keep_title "$w" "${prefix}" 9>&-) &
+      SPIES[$w]=$!
     done
-    # 今回の一覧を次回の比較用に保存（閉じたウィンドウは消える）
+    # 閉じたウィンドウのタイトル監視を片付け、今回の一覧を次回の比較用に保存
+    for w in "${!SPIES[@]}"; do
+      [ -n "${cur[$w]}" ] || { kill "${SPIES[$w]}" 2>/dev/null; unset "SPIES[$w]"; }
+    done
     prev=()
     for w in "${!cur[@]}"; do
       prev[$w]=1
     done
-  done < <(xprop -root -spy _NET_CLIENT_LIST 9>&-)
+  done
+}
+
+# 機能：動いている watch の PID を取得する
+# 入力：なし
+# 出力：PID を標準出力へ（動いていなければ終了コード 1）
+watch_pid() {
+  [ -f "${LOCK_FILE}" ] || return 1
+  flock -n "${LOCK_FILE}" true && return 1
+  cat "${LOCK_FILE}"
+}
+
+# 機能：ウィンドウ監視をオンにする（ログイン時の自動起動を設定し、動いていなければすぐに開始）
+# 入力：なし
+# 出力：自動起動設定の作成と結果の表示
+watch_on() {
+  mkdir -p "$(dirname "${AUTOSTART_FILE}")"
+  cat > "${AUTOSTART_FILE}" <<EOF
+[Desktop Entry]
+Type=Application
+Name=wintag
+Comment=Show the source Docker container in GUI app window titles
+Exec=${SELF} watch
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+EOF
+  watch_pid > /dev/null || setsid -f "${SELF}" watch > /dev/null 2>&1
+  echo "ウィンドウ監視をオンにしました（ログイン時にも自動で開始します）"
+}
+
+# 機能：ウィンドウ監視をオフにする（自動起動の設定を消し、動いている watch を止める）
+# 入力：なし
+# 出力：自動起動設定の削除と結果の表示
+watch_off() {
+  local pid
+  rm -f "${AUTOSTART_FILE}"
+  pid="$(watch_pid)" && kill "${pid}"
+  echo "ウィンドウ監視をオフにしました"
+}
+
+# 機能：ウィンドウ監視の設定と実行状態を表示する
+# 入力：なし
+# 出力：状態を標準出力へ
+watch_status() {
+  local pid
+  if [ -f "${AUTOSTART_FILE}" ]; then echo "設定：オン"; else echo "設定：オフ"; fi
+  if pid="$(watch_pid)"; then echo "監視：実行中（PID ${pid}）"; else echo "監視：停止中"; fi
 }
 
 # 機能：クリックしたウィンドウのアプリを手動で登録する
@@ -259,10 +426,8 @@ register() {
     pid="$$"
   fi
 
-  # 登録し、コンテナのアプリはすぐに付け替えて区別されるようにする
   id="$(capture "${win}" "${src}" "${pid}" "${wm_class}" "$@")" || exit 1
-  [ "${src}" = "${HOST}" ] || set_tag "${win}" "${id}"
-  echo "登録しました: $(sed -n 's/^Name=//p' "${APP_DIR}/${PREFIX}${id}.desktop")（ID: ${id}）"
+  echo "登録しました: ${wm_class}（$(cat "${DATA_DIR}/${id}/name")、ID: ${id}）"
 }
 
 # 機能：登録済みアプリを、保存した環境・作業ディレクトリで起動する（ホストまたはコンテナ内）
@@ -284,8 +449,12 @@ launch() {
     mapfile -t envs < "${dir}/env"
   fi
 
+  # 最後に使った起動元として、Dock のアイコンをクリックしたときの既定にする
+  touch "${dir}"
+  [ -f "${dir}/class" ] && write_desktop "$(cat "${dir}/class")"
+
   if [ -f "${dir}/container" ]; then
-    # コンテナ：X 接続を許可し、停止中ならコンテナを起動してから実行（名前の付け替えは watch が行う）
+    # コンテナ：X 接続を許可し、停止中ならコンテナを起動してから実行（タイトルは watch が付ける）
     cid="$(cat "${dir}/container")"
     xhost "${XHOST_RULE}" > /dev/null
     docker start "${cid}" > /dev/null || { fail "コンテナ ${cid:0:12} を起動できません（削除された可能性があります）"; return; }
@@ -303,27 +472,33 @@ launch() {
 
 # 機能：登録済みエントリの一覧を表示する
 # 入力：なし
-# 出力：「エントリ ID<TAB>表示名」を 1 行ずつ標準出力へ
+# 出力：「エントリ ID<TAB>アプリ名（起動元）」を 1 行ずつ標準出力へ
 list() {
-  local dir id
+  local dir
   for dir in "${DATA_DIR}"/*/; do
-    id="$(basename "${dir}")"
-    printf '%s\t%s\n' "${id}" "$(sed -n 's/^Name=//p' "${APP_DIR}/${PREFIX}${id}.desktop" 2>/dev/null)"
+    printf '%s\t%s（%s）\n' "$(basename "${dir}")" "$(cat "${dir}class" 2>/dev/null)" "$(cat "${dir}name" 2>/dev/null)"
   done
 }
 
-# 機能：指定したエントリ（.desktop とデータ）を削除する
+# 機能：エントリのデータを削除する（.desktop は更新しない）
 # 入力：$1 エントリ ID
-# 出力：該当ファイルの削除
-remove() {
+# 出力：該当フォルダの削除
+remove_entry() {
   # ID が空や ../ を含むと別のフォルダを消してしまうため確認する
   valid_id "$1" || { echo "エントリ ID を指定してください（wintag list で確認）" >&2; return 1; }
-  rm -rf "${DATA_DIR:?}/$1" "${APP_DIR}/${PREFIX}$1.desktop"
+  rm -rf "${DATA_DIR:?}/$1"
 }
 
-# 機能：既に存在しないコンテナのエントリを削除する（ホストのエントリは対象外）
+# 機能：指定したエントリを削除し、.desktop に反映する
+# 入力：$1 エントリ ID
+# 出力：該当ファイルの削除・更新
+remove() {
+  remove_entry "$1" && refresh_desktops
+}
+
+# 機能：既に存在しないコンテナのエントリを削除し、.desktop を作り直す（ホストのエントリは対象外）
 # 入力：なし
-# 出力：該当ファイルの削除
+# 出力：該当ファイルの削除・更新
 cleanup() {
   local dir ids
 
@@ -334,12 +509,16 @@ cleanup() {
   for dir in "${DATA_DIR}"/*/; do
     [ -f "${dir}container" ] || continue
     grep -qxF "$(cat "${dir}container")" <<< "${ids}" \
-      || remove "$(basename "${dir}")"
+      || remove_entry "$(basename "${dir}")"
   done
+  refresh_desktops
 }
 
 # サブコマンドの振り分け
 case "$1" in
+  on)       watch_on ;;
+  off)      watch_off ;;
+  status)   watch_status ;;
   watch)    watch_windows ;;
   register) shift; register "$@" ;;
   list)     list ;;

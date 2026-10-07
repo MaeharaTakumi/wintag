@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-# 機能：ウィンドウを作った X クライアントのプロセスが、どの Docker コンテナで動いているかを調べる
+# 機能：ウィンドウを作った X クライアントのプロセスから、起動元（ホスト・Docker コンテナ）と PID を調べる
 #       X サーバー（XRes 拡張）から見たホスト側の PID を使うため、--net=host のコンテナや
 #       PID が重なる場合でも起動元が一意に決まる
 # 入力：argv[1]   ウィンドウ ID（例 0x3a00004）
-# 出力：コンテナのフル ID を標準出力へ
-#       ホストのアプリ・判定できないウィンドウ（TCP 経由の X 接続など）は何も出力しない
+# 出力：「起動元 PID」を標準出力へ（起動元はコンテナのフル ID または host、PID は起動元から見た番号）
+#       判定できなければ（TCP 経由の X 接続など）何も出力しない
 import ctypes
 import ctypes.util
 import re
 import sys
 
 # ===== パラメータ =====
+HOST = "host"                                      # ホストで動くアプリを表す起動元名
 XRES_CLIENT_ID_PID_MASK = 1 << 1                   # XResQueryClientIds で PID を問い合わせるマスク
 X_SUCCESS = 0                                      # Xlib の成功ステータス
 CONTAINER_RE = re.compile(r"docker[-/]([0-9a-f]{64})")  # cgroup のパスに含まれるコンテナ ID
@@ -67,19 +68,22 @@ def client_pid(win):
     return pid
 
 
-def container_of(pid):
+def source_of(pid):
     """機能：ホスト側 PID のプロセスがどのコンテナに属するかを cgroup から調べる
     入力：pid  ホスト側 PID
-    出力：コンテナのフル ID、コンテナのプロセスでなければ None"""
+    出力：(起動元, 起動元から見た PID)、プロセスがなければ None"""
     try:
         with open(f"/proc/{pid}/cgroup") as f:
             match = CONTAINER_RE.search(f.read())
-    except OSError:
+        with open(f"/proc/{pid}/status") as f:
+            # NSpid の最後の値が、プロセス自身の PID 名前空間での番号
+            nspid = next(line.split()[-1] for line in f if line.startswith("NSpid:"))
+    except (OSError, StopIteration):
         return None
-    return match.group(1) if match else None
+    return (match.group(1), nspid) if match else (HOST, str(pid))
 
 
 pid = client_pid(int(sys.argv[1], 16))
-cid = container_of(pid) if pid else None
-if cid:
-    print(cid)
+src = source_of(pid) if pid else None
+if src:
+    print(*src)

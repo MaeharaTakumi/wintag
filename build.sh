@@ -1,6 +1,6 @@
 #!/bin/bash
 # 機能：wintag の .deb パッケージを作成する
-# 入力：同じフォルダにある wintag / wintag-source.py / README.md
+# 入力：同じフォルダにある wintag / wintag-icon.py / wintag-source.py / README.md
 # 出力：${NAME}_${VERSION}_all.deb
 set -e
 
@@ -8,8 +8,8 @@ set -e
 NAME="wintag"                                        # パッケージ名
 VERSION="2.2.0"                                      # バージョン
 MAINTAINER="wintag <noreply@localhost>"              # 作成者（配布する場合は自分の名前・連絡先に変更）
-DEPENDS="bash (>= 4.4), python3, x11-utils, libx11-6, libxres1"  # 必須の依存パッケージ
-RECOMMENDS="docker.io | docker-ce-cli"               # 推奨（コンテナ名の取得に使用。ない場合はコンテナ ID を表示）
+DEPENDS="bash (>= 4.4), python3, x11-utils, x11-xserver-utils, libx11-6, libxres1"  # 必須の依存パッケージ
+RECOMMENDS="docker.io | docker-ce-cli, libnotify-bin" # 推奨（Docker 内のアプリの識別、起動失敗の通知に使用）
 OLD_AUTOSTART="/etc/xdg/autostart/${NAME}-watch.desktop"  # 2.1.0 以前が全ユーザー向けに置いた自動起動設定（更新時に削除）
 OLD_AUTOSTART_UNTIL="2.2.0~"                         # この版より前から更新するときに OLD_AUTOSTART を削除
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)"             # 元ファイルの場所
@@ -24,6 +24,7 @@ mkdir -p "${BUILD_DIR}/DEBIAN" \
 
 # 各ファイルを配置（実行ファイルは 755、それ以外は 644）
 install -m 755 "${SRC_DIR}/wintag"               "${BUILD_DIR}/usr/bin/${NAME}"
+install -m 755 "${SRC_DIR}/wintag-icon.py"       "${BUILD_DIR}/usr/lib/${NAME}/wintag-icon.py"
 install -m 755 "${SRC_DIR}/wintag-source.py"     "${BUILD_DIR}/usr/lib/${NAME}/wintag-source.py"
 
 # 使い方をドキュメントとして同梱
@@ -53,6 +54,8 @@ Description: Tell GUI app windows apart by their source Docker container
  When enabled with "wintag on", watches new X11 windows and prefixes the
  title of each window from a Docker container with the container name, so
  windows of the same app grouped under one GNOME Dock icon can be told apart.
+ Each app gets one launcher whose right-click menu starts it in a chosen
+ container. Apps can also be registered manually by clicking their window.
 EOF
 
 # .deb を作成
